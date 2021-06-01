@@ -3508,31 +3508,42 @@ def find_library(lib, lib_dirs):
   return None
 
 
+def find_library_shortname(lib, lib_dirs):
+  suffixes = STATICLIB_ENDINGS + DYNAMICLIB_ENDINGS
+
+  for suff in suffixes:
+    name = 'lib' + lib + suff
+    path = find_library(name, lib_dirs)
+    if path:
+      return path
+
+  return None
+
+
 def process_libraries(libs, lib_dirs, linker_inputs):
   libraries = []
   consumed = []
-  suffixes = STATICLIB_ENDINGS + DYNAMICLIB_ENDINGS
 
   # Find library files
   for i, lib in libs:
     logger.debug('looking for library "%s"', lib)
 
-    path = None
-    for suff in suffixes:
-      name = 'lib' + lib + suff
-      path = find_library(name, lib_dirs)
-      if path:
-        break
-
-    if path:
-      linker_inputs.append((i, path))
+    js_libs, native_lib = building.map_to_js_libs(lib)
+    if js_libs is not None:
+      libraries += [(i, js_lib) for js_lib in js_libs]
+      consumed.append(i)
+      # If native_lib is returned then proceed to look that
+      # up using `find_library` below.
+      if native_lib:
+        path = find_library_shortname(native_lib, lib_dirs)
+        if path:
+          linker_inputs.append((i, path))
+    elif building.map_and_apply_to_settings(lib):
       consumed.append(i)
     else:
-      jslibs = building.map_to_js_libs(lib)
-      if jslibs is not None:
-        libraries += [(i, jslib) for jslib in jslibs]
-        consumed.append(i)
-      elif building.map_and_apply_to_settings(lib):
+      path = find_library_shortname(lib, lib_dirs)
+      if path:
+        linker_inputs.append((i, path))
         consumed.append(i)
 
   settings.SYSTEM_JS_LIBRARIES += libraries
