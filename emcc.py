@@ -42,7 +42,7 @@ from tools import shared, system_libs
 from tools import colored_logger, diagnostics, building
 from tools.shared import unsuffixed, unsuffixed_basename, WINDOWS, safe_copy
 from tools.shared import run_process, read_and_preprocess, exit_with_error, DEBUG
-from tools.shared import do_replace
+from tools.shared import do_replace, strip_prefix
 from tools.response_file import substitute_response_files
 from tools.minimal_runtime_shell import generate_minimal_runtime_html
 import tools.line_endings
@@ -203,15 +203,12 @@ class EmccState:
     self.has_dash_c = False
     self.has_dash_E = False
     self.has_dash_S = False
-    self.libs = []
     self.link_flags = []
     self.lib_dirs = []
     self.forced_stdlibs = []
 
 
 def add_link_flag(state, i, f):
-  if f.startswith('-l'):
-    state.libs.append((i, f[2:]))
   if f.startswith('-L'):
     state.lib_dirs.append(f[2:])
 
@@ -335,7 +332,7 @@ def apply_settings(changes):
     # and we can't just flip them, so leave them as-is to be
     # handled in a special way later)
     if key.startswith('NO_') and value in ('0', '1'):
-      key = key[3:]
+      key = strip_prefix(key, 'NO_')
       value = str(1 - int(value))
     return key, value
 
@@ -357,10 +354,10 @@ def apply_settings(changes):
 
     filename = None
     if value and value[0] == '@':
-      filename = value[1:]
+      filename = strip_prefix(value, '@')
       if not os.path.exists(filename):
         exit_with_error('%s: file not found parsing argument: %s=%s' % (filename, key, value))
-      value = open(filename).read()
+      value = open(filename).read().strip()
     else:
       value = value.replace('\\', '\\\\')
 
@@ -462,7 +459,11 @@ def filter_link_flags(flags, using_lld):
         # lld allows various flags to have either a single -foo or double --foo
         if f.startswith(flag) or f.startswith('-' + flag):
           diagnostics.warning('linkflags', 'ignoring unsupported linker flag: `%s`', f)
-          return False, takes_arg
+          # Skip the next argument if this linker flag takes and argument and that
+          # argument was not specified as a separately (i.e. it was specified as
+          # single arg containing an `=` char.)
+          skip_next = takes_arg and '=' not in f
+          return False, skip_next
       return True, False
     else:
       if f in SUPPORTED_LINKER_FLAGS:
@@ -618,7 +619,7 @@ def is_dash_s_for_emcc(args, i):
       return False
     arg = args[i + 1]
   else:
-    arg = args[i][2:]
+    arg = strip_prefix(args[i], '-s')
   arg = arg.split('=')[0]
   return arg.isidentifier() and arg.isupper()
 
@@ -634,7 +635,7 @@ def filter_out_dynamic_libs(options, inputs):
     else:
       return True
 
-  return [f for f in inputs if check(f[1])]
+  return [f for f in inputs if check(f)]
 
 
 def filter_out_duplicate_dynamic_libs(inputs):
@@ -650,7 +651,7 @@ def filter_out_duplicate_dynamic_libs(inputs):
       seen.add(abspath)
     return True
 
-  return [f for f in inputs if check(f[1])]
+  return [f for f in inputs if check(f)]
 
 
 def process_dynamic_libs(dylibs, lib_dirs):
@@ -714,7 +715,7 @@ def parse_s_args(args):
           key = args[i + 1]
           args[i + 1] = ''
         else:
-          key = args[i][2:]
+          key = strip_prefix(args[i], '-s')
         args[i] = ''
 
         # If not = is specified default to 1
@@ -748,11 +749,6 @@ def emsdk_ldflags(user_args):
 
   if '-nostdlib' in user_args:
     return ldflags
-
-  # TODO(sbc): Add system libraries here rather than conditionally including
-  # them via .symbols files.
-  libraries = []
-  ldflags += ['-l' + l for l in libraries]
 
   return ldflags
 
@@ -1054,7 +1050,7 @@ There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR P
   if state.mode == Mode.POST_LINK_ONLY:
     settings.limit_settings(None)
     target, wasm_target = phase_linker_setup(options, state, newargs, settings_map)
-    process_libraries(state.libs, state.lib_dirs, [])
+    process_libraries(state, [])
     if len(input_files) != 1:
       exit_with_error('--post-link requires a single input file')
     phase_post_link(options, state, input_files[0][1], wasm_target, target)
@@ -1117,24 +1113,23 @@ def phase_calculate_linker_inputs(options, state, linker_inputs):
   state.link_flags = filter_link_flags(state.link_flags, using_lld)
 
   # Decide what we will link
-  consumed = process_libraries(state.libs, state.lib_dirs, linker_inputs)
-  # Filter out libraries that are actually JS libs
-  state.link_flags = [l for l in state.link_flags if l[0] not in consumed]
+  process_libraries(state, linker_inputs)
+
+  linker_args = [val for _, val in sorted(linker_inputs + state.link_flags)]
 
   # If we are linking to an intermediate object then ignore other
   # "fake" dynamic libraries, since otherwise we will end up with
   # multiple copies in the final executable.
   if options.oformat == OFormat.OBJECT or options.ignore_dynamic_linking:
-    linker_inputs = filter_out_dynamic_libs(options, linker_inputs)
+    linker_args = filter_out_dynamic_libs(options, linker_args)
   else:
-    linker_inputs = filter_out_duplicate_dynamic_libs(linker_inputs)
+    linker_args = filter_out_duplicate_dynamic_libs(linker_args)
 
   if settings.MAIN_MODULE:
-    dylibs = [i[1] for i in linker_inputs if building.is_wasm_dylib(i[1])]
+    dylibs = [a for a in linker_args if building.is_wasm_dylib(a)]
     process_dynamic_libs(dylibs, state.lib_dirs)
 
-  linker_arguments = [val for _, val in sorted(linker_inputs + state.link_flags)]
-  return linker_arguments
+  return linker_args
 
 
 @ToolchainProfiler.profile_block('parse arguments')
@@ -1244,8 +1239,8 @@ def phase_setup(options, state, newargs, settings_map):
         # For shared libraries that are neither bitcode nor wasm, assuming its local native
         # library and attempt to find a library by the same name in our own library path.
         # TODO(sbc): Do we really need this feature?  See test_other.py:test_local_link
-        libname = unsuffixed_basename(arg).lstrip('lib')
-        state.libs.append((i, libname))
+        libname = strip_prefix(unsuffixed_basename(arg), 'lib')
+        add_link_flag(state, i, '-l' + libname)
       else:
         input_files.append((i, arg))
     elif arg.startswith('-L'):
@@ -1845,8 +1840,6 @@ def phase_linker_setup(options, state, newargs, settings_map):
       exit_with_error('USE_PTHREADS=2 is no longer supported')
     if settings.ALLOW_MEMORY_GROWTH:
       diagnostics.warning('pthreads-mem-growth', 'USE_PTHREADS + ALLOW_MEMORY_GROWTH may run non-wasm code slowly, see https://github.com/WebAssembly/design/issues/1271')
-    # UTF8Decoder.decode may not work with a view of a SharedArrayBuffer, see https://github.com/whatwg/encoding/issues/172
-    settings.TEXTDECODER = 0
     settings.SYSTEM_JS_LIBRARIES.append((0, shared.path_from_root('src', 'library_pthread.js')))
     settings.EXPORTED_FUNCTIONS += [
       '___emscripten_pthread_data_constructor',
@@ -1987,7 +1980,7 @@ def phase_linker_setup(options, state, newargs, settings_map):
   # When not declaring wasm module exports in outer scope one by one, disable minifying
   # wasm module export names so that the names can be passed directly to the outer scope.
   # Also, if using library_exports.js API, disable minification so that the feature can work.
-  if not settings.DECLARE_ASM_MODULE_EXPORTS or 'exports.js' in [x for _, x in state.libs]:
+  if not settings.DECLARE_ASM_MODULE_EXPORTS or '-lexports.js' in [x for _, x in state.link_flags]:
     settings.MINIFY_ASMJS_EXPORT_NAMES = 0
 
   # Enable minification of wasm imports and exports when appropriate, if we
@@ -2231,6 +2224,9 @@ def phase_linker_setup(options, state, newargs, settings_map):
     if settings.SINGLE_FILE:
       exit_with_error('NODE_CODE_CACHING saves a file on the side and is not compatible with SINGLE_FILE')
 
+  if not shared.JS.isidentifier(settings.EXPORT_NAME):
+    exit_with_error(f'EXPORT_NAME is not a valid JS identifier: `{settings.EXPORT_NAME}`')
+
   if options.tracing and settings.ALLOW_MEMORY_GROWTH:
     settings.DEFAULT_LIBRARY_FUNCS_TO_INCLUDE += ['emscripten_trace_report_memory_layout']
     settings.EXPORTED_FUNCTIONS += ['_emscripten_stack_get_current',
@@ -2291,7 +2287,7 @@ def phase_compile_inputs(options, state, newargs, input_files):
         return_next = True
         continue
       if item.startswith('-x'):
-        return item[2:]
+        return strip_prefix(item, '-x')
     return ''
 
   language_mode = get_language_mode(newargs)
@@ -2726,7 +2722,7 @@ def parse_args(newargs):
 
     if arg.startswith('-O'):
       # Let -O default to -O2, which is what gcc does.
-      options.requested_level = arg[2:] or '2'
+      options.requested_level = strip_prefix(arg, '-O') or '2'
       if options.requested_level == 's':
         options.requested_level = 2
         settings.SHRINK_LEVEL = 1
@@ -2781,7 +2777,7 @@ def parse_args(newargs):
       settings.DEBUG_LEVEL = max(1, settings.DEBUG_LEVEL)
     elif arg.startswith('-g'):
       options.requested_debug = arg
-      requested_level = arg[2:] or '3'
+      requested_level = strip_prefix(arg, '-g') or '3'
       if is_int(requested_level):
         # the -gX value is the debug level (-g1, -g2, etc.)
         settings.DEBUG_LEVEL = validate_arg_level(requested_level, 4, 'Invalid debug level: ' + arg)
@@ -2956,7 +2952,7 @@ def parse_args(newargs):
     elif arg == '-frtti':
       settings.USE_RTTI = 1
     elif arg.startswith('-jsD'):
-      key = arg[4:]
+      key = strip_prefix(arg, '-jsD')
       if '=' in key:
         key, value = key.split('=')
       else:
@@ -2972,7 +2968,7 @@ def parse_args(newargs):
     elif check_arg('-o'):
       options.output_file = consume_arg()
     elif arg.startswith('-o'):
-      options.output_file = arg[2:]
+      options.output_file = strip_prefix(arg, '-o')
       newargs[i] = ''
     elif arg == '-mllvm':
       # Ignore the next argument rather than trying to parse it.  This is needed
@@ -3504,32 +3500,52 @@ def find_library(lib, lib_dirs):
   return None
 
 
-def process_libraries(libs, lib_dirs, linker_inputs):
+def process_libraries(state, linker_inputs):
+  new_flags = []
   libraries = []
-  consumed = []
   suffixes = STATICLIB_ENDINGS + DYNAMICLIB_ENDINGS
+  system_libs_map = system_libs.Library.get_usable_variations()
 
   # Find library files
-  for i, lib in libs:
+  for i, flag in state.link_flags:
+    if not flag.startswith('-l'):
+      new_flags.append((i, flag))
+      continue
+    lib = strip_prefix(flag, '-l')
+
     logger.debug('looking for library "%s"', lib)
+    js_libs, native_lib = building.map_to_js_libs(lib)
+    if js_libs is not None:
+      libraries += [(i, js_lib) for js_lib in js_libs]
+      # If native_lib is returned then include it in the link
+      # via forced_stdlibs.
+      if native_lib:
+        state.forced_stdlibs.append(native_lib)
+      continue
+
+    # We don't need to resolve system libraries to absolute paths here, we can just
+    # let wasm-ld handle that.  However, we do want to map to the correct variant.
+    # For example we map `-lc` to `-lc-mt` if we are building with threading support.
+    if 'lib' + lib in system_libs_map:
+      lib = system_libs_map['lib' + lib]
+      new_flags.append((i, '-l' + strip_prefix(lib.get_base_name(), 'lib')))
+      continue
+
+    if building.map_and_apply_to_settings(lib):
+      continue
 
     path = None
     for suff in suffixes:
       name = 'lib' + lib + suff
-      path = find_library(name, lib_dirs)
+      path = find_library(name, state.lib_dirs)
       if path:
         break
 
     if path:
       linker_inputs.append((i, path))
-      consumed.append(i)
-    else:
-      jslibs = building.map_to_js_libs(lib)
-      if jslibs is not None:
-        libraries += [(i, jslib) for jslib in jslibs]
-        consumed.append(i)
-      elif building.map_and_apply_to_settings(lib):
-        consumed.append(i)
+      continue
+
+    new_flags.append((i, flag))
 
   settings.SYSTEM_JS_LIBRARIES += libraries
 
@@ -3537,7 +3553,7 @@ def process_libraries(libs, lib_dirs, linker_inputs):
   # Sort the input list from (order, lib_name) pairs to a flat array in the right order.
   settings.SYSTEM_JS_LIBRARIES.sort(key=lambda lib: lib[0])
   settings.SYSTEM_JS_LIBRARIES = [lib[1] for lib in settings.SYSTEM_JS_LIBRARIES]
-  return consumed
+  state.link_flags = new_flags
 
 
 class ScriptSource:

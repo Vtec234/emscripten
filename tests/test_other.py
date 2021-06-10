@@ -35,7 +35,7 @@ from tools.shared import CLANG_CC, CLANG_CXX, LLVM_AR, LLVM_DWARFDUMP, EMCMAKE, 
 from runner import RunnerCore, path_from_root, is_slow_test, ensure_dir, disabled, make_executable
 from runner import env_modify, no_mac, no_windows, requires_native_clang, with_env_modify
 from runner import create_file, parameterized, NON_ZERO, node_pthreads, TEST_ROOT, test_file
-from runner import compiler_for, read_file, read_binary
+from runner import compiler_for, read_file, read_binary, EMBUILDER, require_v8, require_node
 from tools import shared, building, utils, deps_info
 import jsrun
 import clang_native
@@ -209,6 +209,19 @@ class other(RunnerCore):
     self.assertContained('export default Module;', src)
     src = read_file('subdir/hello_world.worker.js')
     self.assertContained('import("./hello_world.mjs")', src)
+
+  def test_emcc_output_worker_mjs_single_file(self):
+    self.run_process([EMCC, '-o', 'hello_world.mjs', '-pthread',
+                      test_file('hello_world.c'), '-s', 'SINGLE_FILE=1'])
+    src = read_file('hello_world.mjs')
+    self.assertNotContained("new URL('data:", src)
+    self.assertContained("new Worker(new URL('hello_world.worker.js', import.meta.url))", src)
+
+  def test_emcc_output_mjs_closure(self):
+    self.run_process([EMCC, '-o', 'hello_world.mjs',
+                      test_file('hello_world.c'), '--closure=1'])
+    src = read_file('hello_world.mjs')
+    self.assertContained('new URL("hello_world.wasm", import.meta.url)', src)
 
   def test_export_es6_implies_modularize(self):
     self.run_process([EMCC, test_file('hello_world.c'), '-s', 'EXPORT_ES6=1'])
@@ -415,6 +428,9 @@ There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR P
     self.assertNotExists('twopart_side.o')
     self.assertNotExists(test_file('twopart_main.o'))
     self.assertNotExists(test_file('twopart_side.o'))
+
+  def test_tsearch(self):
+    self.do_other_test('test_tsearch.c')
 
   def test_combining_object_files(self):
     # Compiling two files with -c will generate separate object files
@@ -1392,7 +1408,12 @@ int f() {
     self.run_process([EMCC, 'main.c', '-L.', '-lexport', '-s', 'EXPORTED_FUNCTIONS=%s' % full_export_name])
     self.assertTrue(self.is_exported_in_wasm(export_name, 'a.out.wasm'))
 
-  def test_embed_file(self):
+  @parameterized({
+    'embed': (['--embed-file', 'somefile.txt'],),
+    'embed-twice': (['--embed-file', 'somefile.txt', '--embed-file', 'somefile.txt'],),
+    'preload': (['--preload-file', 'somefile.txt'],)
+  })
+  def test_include_file(self, args):
     create_file('somefile.txt', 'hello from a file with lots of data and stuff in it thank you very much')
     create_file('main.cpp', r'''
       #include <stdio.h>
@@ -1407,12 +1428,10 @@ int f() {
       }
     ''')
 
-    self.run_process([EMXX, 'main.cpp', '--embed-file', 'somefile.txt'])
-    self.assertContained('|hello from a file wi|', self.run_js('a.out.js'))
-
-    # preload twice, should not err
-    self.run_process([EMXX, 'main.cpp', '--embed-file', 'somefile.txt', '--embed-file', 'somefile.txt'])
-    self.assertContained('|hello from a file wi|', self.run_js('a.out.js'))
+    self.run_process([EMXX, 'main.cpp'] + args)
+    # run in node.js to ensure we verify that file preloading works there
+    result = self.run_js('a.out.js', engine=config.NODE_JS)
+    self.assertContained('|hello from a file wi|', result)
 
   def test_embed_file_dup(self):
     ensure_dir(self.in_dir('tst', 'test1'))
@@ -2587,12 +2606,12 @@ void wakaw::Cm::RasterBase<wakaw::watwat::Polocator>::merbine1<wakaw::Cm::Raster
       print(output)
     self.assertLess(output.count('Cannot enlarge memory arrays'),  5)
 
+  @require_node
   def test_module_exports_with_closure(self):
-    # This test checks that module.export is retained when JavaScript is minified by compiling with --closure 1
-    # This is important as if module.export is not present the Module object will not be visible to node.js
-
-    # First make sure test.js isn't present.
-    self.clear()
+    # This test checks that module.export is retained when JavaScript
+    # is minified by compiling with --closure 1
+    # This is important as if module.export is not present the Module
+    # object will not be visible to node.js
 
     # compile with -O2 --closure 0
     self.run_process([EMCC, test_file('Module-exports/test.c'),
@@ -2612,8 +2631,7 @@ void wakaw::Cm::RasterBase<wakaw::watwat::Polocator>::merbine1<wakaw::Cm::Raster
     # Check that main.js (which requires test.js) completes successfully when run in node.js
     # in order to check that the exports are indeed functioning correctly.
     shutil.copyfile(test_file('Module-exports/main.js'), 'main.js')
-    if config.NODE_JS in config.JS_ENGINES:
-      self.assertContained('bufferTest finished', self.run_js('main.js'))
+    self.assertContained('bufferTest finished', self.run_js('main.js'))
 
     # Delete test.js again and check it's gone.
     try_delete('test.js')
@@ -2637,14 +2655,11 @@ void wakaw::Cm::RasterBase<wakaw::watwat::Polocator>::merbine1<wakaw::Cm::Raster
 
     # Check that main.js (which requires test.js) completes successfully when run in node.js
     # in order to check that the exports are indeed functioning correctly.
-    if config.NODE_JS in config.JS_ENGINES:
-      self.assertContained('bufferTest finished', self.run_js('main.js', engine=config.NODE_JS))
+    self.assertContained('bufferTest finished', self.run_js('main.js'))
 
+  @require_node
   def test_node_catch_exit(self):
     # Test that in node.js exceptions are not caught if NODEJS_EXIT_CATCH=0
-    if config.NODE_JS not in config.JS_ENGINES:
-      return
-
     create_file('count.c', '''
       #include <string.h>
       int count(const char *str) {
@@ -2664,19 +2679,18 @@ void wakaw::Cm::RasterBase<wakaw::watwat::Polocator>::merbine1<wakaw::Cm::Raster
 
     # Check that the ReferenceError is caught and rethrown and thus the original error line is masked
     self.assertNotContained(reference_error_text,
-                            self.run_js('index.js', engine=config.NODE_JS, assert_returncode=NON_ZERO))
+                            self.run_js('index.js', assert_returncode=NON_ZERO))
 
     self.run_process([EMCC, 'count.c', '-o', 'count.js', '-s', 'NODEJS_CATCH_EXIT=0'])
 
     # Check that the ReferenceError is not caught, so we see the error properly
     self.assertContained(reference_error_text,
-                         self.run_js('index.js', engine=config.NODE_JS, assert_returncode=NON_ZERO))
+                         self.run_js('index.js', assert_returncode=NON_ZERO))
 
+  @require_node
   def test_exported_runtime_methods(self):
-    # Test with node.js that the EXPORTED_RUNTIME_METHODS setting is considered by libraries
-    if config.NODE_JS not in config.JS_ENGINES:
-      self.skipTest("node engine required for this test")
-
+    # Test with node.js that the EXPORTED_RUNTIME_METHODS setting is
+    # considered by libraries
     create_file('count.c', '''
       #include <string.h>
       int count(const char *str) {
@@ -2696,13 +2710,12 @@ void wakaw::Cm::RasterBase<wakaw::watwat::Polocator>::merbine1<wakaw::Cm::Raster
                      'EXPORTED_RUNTIME_METHODS=FS_writeFile', '-o', 'count.js'])
 
     # Check that the Module.FS_writeFile exists
-    self.assertNotContained(reference_error_text,
-                            self.run_js('index.js', engine=config.NODE_JS))
+    self.assertNotContained(reference_error_text, self.run_js('index.js'))
 
     self.run_process([EMCC, 'count.c', '-s', 'FORCE_FILESYSTEM', '-o', 'count.js'])
 
     # Check that the Module.FS_writeFile is not exported
-    out = self.run_js('index.js', engine=config.NODE_JS)
+    out = self.run_js('index.js')
     self.assertContained(reference_error_text, out)
 
   def test_fs_stream_proto(self):
@@ -2748,6 +2761,7 @@ int main()
       out = self.run_js('a.out.js', engine=engine)
       self.assertContained('File size: 724', out)
 
+  @require_node
   def test_node_emscripten_num_logical_cores(self):
     # Test with node.js that the emscripten_num_logical_cores method is working
     create_file('src.cpp', r'''
@@ -5090,12 +5104,14 @@ int main(void) {
     self.run_process([EMCC, 'libfoo.a'])
     self.assertContained('hello, world!', self.run_js('a.out.js'))
 
+  @require_node
   def test_require(self):
     inname = test_file('hello_world.c')
     self.emcc(inname, args=['-s', 'ASSERTIONS=0'], output_filename='a.out.js')
     output = self.run_process(config.NODE_JS + ['-e', 'require("./a.out.js")'], stdout=PIPE, stderr=PIPE)
     assert output.stdout == 'hello, world!\n' and output.stderr == '', 'expected no output, got\n===\nSTDOUT\n%s\n===\nSTDERR\n%s\n===\n' % (output.stdout, output.stderr)
 
+  @require_node
   def test_require_modularize(self):
     self.run_process([EMCC, test_file('hello_world.c'), '-s', 'MODULARIZE', '-s', 'ASSERTIONS=0'])
     src = read_file('a.out.js')
@@ -6599,7 +6615,7 @@ mergeInto(LibraryManager.library, {
   def test_override_c_environ(self):
     create_file('pre.js', r'''
       var Module = {
-        preRun: [function() { ENV.hello = 'world' }]
+        preRun: [function() { ENV.hello = 'world'; ENV.LANG = undefined; }]
       };
     ''')
     create_file('src.cpp', r'''
@@ -6607,10 +6623,13 @@ mergeInto(LibraryManager.library, {
       #include <stdio.h>
       int main() {
         printf("|%s|\n", getenv("hello"));
+        printf("LANG is %s\n", getenv("LANG") ? "set" : "not set");
       }
     ''')
     self.run_process([EMXX, 'src.cpp', '--pre-js', 'pre.js'])
-    self.assertContained('|world|', self.run_js('a.out.js'))
+    output = self.run_js('a.out.js')
+    self.assertContained('|world|', output)
+    self.assertContained('LANG is not set', output)
 
     create_file('pre.js', r'''
       var Module = {
@@ -7403,13 +7422,11 @@ int main() {
 
   # We have LTO tests covered in 'wasmltoN' targets in test_core.py, but they
   # don't run as a part of Emscripten CI, so we add a separate LTO test here.
+  @require_v8
   def test_lto_wasm_exceptions(self):
-    if not config.V8_ENGINE or config.V8_ENGINE not in config.JS_ENGINES:
-      self.skipTest('d8 required to run wasm eh tests')
     self.set_setting('EXCEPTION_DEBUG')
     self.emcc_args += ['-fwasm-exceptions', '-flto']
     self.v8_args.append('--experimental-wasm-eh')
-    self.js_engines = [config.V8_ENGINE]
     self.do_run_from_file(test_file('core/test_exceptions.cpp'), test_file('core/test_exceptions_caught.out'))
 
   def test_wasm_nope(self):
@@ -7421,6 +7438,7 @@ int main() {
       out = self.run_js('a.out.js', assert_returncode=NON_ZERO)
       self.assertContained('no native wasm support detected', out)
 
+  @require_node
   def test_jsrun(self):
     print(config.NODE_JS)
     jsrun.WORKING_ENGINES = {}
@@ -8136,6 +8154,7 @@ T5:ASSERTIONS
 T6:(else) !ASSERTIONS""", output)
 
   # Tests that Emscripten-compiled applications can be run from a relative path with node command line that is different than the current working directory.
+  @require_node
   def test_node_js_run_from_different_directory(self):
     ensure_dir('subdir')
     self.run_process([EMCC, test_file('hello_world.c'), '-o', Path('subdir/a.js'), '-O3'])
@@ -8143,6 +8162,7 @@ T6:(else) !ASSERTIONS""", output)
     self.assertContained('hello, world!', ret)
 
   # Tests that a pthreads + modularize build can be run in node js
+  @require_node
   def test_node_js_pthread_module(self):
     # create module loader script
     moduleLoader = 'moduleLoader.js'
@@ -9536,6 +9556,12 @@ Module.arguments has been replaced with plain arguments_ (the initial value can 
     out = self.run_process([EMXX, test_file('hello_world.cpp'), '-Wl,-version-script,foo'], stderr=PIPE).stderr
     self.assertContained('warning: ignoring unsupported linker flag: `-version-script`', out)
 
+  def test_supported_linker_flag_skip_next(self):
+    # Regression test for a bug where skipping an unsupported linker flag
+    # could skip the next unrelated linker flag.
+    err = self.expect_fail([EMXX, test_file('hello_world.cpp'), '-Wl,-rpath=foo', '-lbar'])
+    self.assertContained('error: unable to find library -lbar', err)
+
   def test_linker_flags_pass_through(self):
     err = self.expect_fail([EMXX, test_file('hello_world.cpp'), '-Wl,--waka'])
     self.assertContained('wasm-ld: error: unknown argument: --waka', err)
@@ -10433,8 +10459,15 @@ exec "$@"
         cmd.append('-sUSE_WEBGPU')
       if function.startswith('__cxa_'):
         cmd.append('-fexceptions')
-      # Causes WebAssemblyLowerEmscriptenEHSjLj pass in llvm to crash
-      if function == 'setjmp':
+      # In WebAssemblyLowerEmscriptenEHSjLj pass in the LLVM backend, function
+      # calls that exist in the same function with setjmp are converted to some
+      # code sequence that includes emscripten_longjmp. emscripten_longjmp is
+      # included in deps_info.py because in non-LTO builds setjmp does not exist
+      # anymore in the object files. So the mere indirect reference of setjmp or
+      # emscripten_longjmp does not generate calls to its dependencies specified
+      # in deps_info.py. Also Emscripten EH has a known restriction that setjmp
+      # cannot be called or referenced indirectly anyway.
+      if function in ['emscripten_longjmp', 'setjmp']:
         continue
       print(shared.shlex_join(cmd))
       self.run_process(cmd)
@@ -10447,13 +10480,12 @@ exec "$@"
         if direct not in js and via_module not in js and assignment not in js:
           self.fail(f'use of declared dependency {dep} not found in JS output for {function}')
 
+  @require_v8
   def test_shell_Oz(self):
     # regression test for -Oz working on non-web, non-node environments that
     # lack TextDecoder
-    if config.V8_ENGINE not in config.JS_ENGINES:
-      return self.skipTest('no shell to test')
     self.run_process([EMCC, test_file('hello_world.c'), '-Oz'])
-    self.assertContained('hello, world!', self.run_js('a.out.js', engine=config.V8_ENGINE))
+    self.assertContained('hello, world!', self.run_js('a.out.js'))
 
   def test_runtime_keepalive(self):
     self.uses_es6 = True
@@ -10593,3 +10625,35 @@ kill -9 $$
   def test_link_only_setting_warning(self):
     err = self.run_process([EMCC, '-sALLOW_MEMORY_GROWTH', '-c', test_file('hello_world.c')], stderr=PIPE).stderr
     self.assertContained("warning: linker setting ignored during compilation: 'ALLOW_MEMORY_GROWTH' [-Wunused-command-line-argument]", err)
+
+  def test_no_deprecated(self):
+    # Test that -Wno-deprecated is passed on to clang driver
+    create_file('test.c', '''\
+        __attribute__((deprecated)) int foo();
+        int main() { return foo(); }
+    ''')
+    err = self.expect_fail([EMCC, '-c', '-Werror', 'test.c'])
+    self.assertContained("error: 'foo' is deprecated", err)
+    self.run_process([EMCC, '-c', '-Werror', '-Wno-deprecated', 'test.c'])
+
+  def test_bad_export_name(self):
+    err = self.expect_fail([EMCC, '-sEXPORT_NAME=foo bar', test_file('hello_world.c')])
+    self.assertContained('error: EXPORT_NAME is not a valid JS identifier: `foo bar`', err)
+
+  def test_standard_library_mapping(self):
+    # Test the `-l` flags on the command line get mapped the correct libraries variant
+    self.run_process([EMBUILDER, 'build', 'libc-mt', 'libcompiler_rt-mt', 'libdlmalloc-mt'])
+
+    libs = ['-lc', '-lc_rt_wasm', '-lcompiler_rt', '-lmalloc']
+    err = self.run_process([EMCC, test_file('hello_world.c'), '-pthread', '-nostdlib', '-v'] + libs, stderr=PIPE).stderr
+
+    # Check the the linker was run with `-mt` variants because `-pthread` was passed.
+    self.assertContained(' -lc-mt ', err)
+    self.assertContained(' -ldlmalloc-mt ', err)
+    self.assertContained(' -lcompiler_rt-mt ', err)
+
+  def test_explict_gl_linking(self):
+    # Test that libGL can be linked explictly via `-lGL` rather than implictly.
+    # Here we use NO_AUTO_NATIVE_LIBRARIES to disable the implictly linking that normally
+    # includes the native GL library.
+    self.run_process([EMCC, test_file('other/test_explict_gl_linking.c'), '-sNO_AUTO_NATIVE_LIBRARIES', '-lGL'])

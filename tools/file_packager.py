@@ -521,14 +521,12 @@ def main():
     remote_package_size = os.path.getsize(package_name)
     remote_package_name = os.path.basename(package_name)
     ret += r'''
-      var PACKAGE_PATH;
+      var PACKAGE_PATH = '';
       if (typeof window === 'object') {
         PACKAGE_PATH = window['encodeURIComponent'](window.location.pathname.toString().substring(0, window.location.pathname.toString().lastIndexOf('/')) + '/');
-      } else if (typeof location !== 'undefined') {
-        // worker
+      } else if (typeof process === 'undefined' && typeof location !== 'undefined') {
+        // web worker
         PACKAGE_PATH = encodeURIComponent(location.pathname.toString().substring(0, location.pathname.toString().lastIndexOf('/')) + '/');
-      } else {
-        throw 'using preloaded data can only be done on a web page or in a web worker';
       }
       var PACKAGE_NAME = '%s';
       var REMOTE_PACKAGE_BASE = '%s';
@@ -712,6 +710,16 @@ def main():
 
     ret += r'''
       function fetchRemotePackage(packageName, packageSize, callback, errback) {
+        if (typeof process === 'object') {
+          require('fs').readFile(packageName, function(err, contents) {
+            if (err) {
+              errback(err);
+            } else {
+              callback(contents.buffer);
+            }
+          });
+          return;
+        }
         var xhr = new XMLHttpRequest();
         xhr.open('GET', packageName, true);
         xhr.responseType = 'arraybuffer';
